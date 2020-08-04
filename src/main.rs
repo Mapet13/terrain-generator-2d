@@ -1,19 +1,21 @@
-use std::env;
-use std::path::Path;
-
-use sdl2::event::Event;
-use sdl2::pixels::Color;
-use sdl2::{keyboard::Keycode, rect::Rect};
-use sdl2::image::{LoadTexture, InitFlag};
+use opensimplex_noise_rs::OpenSimplexNoise;
 
 use image::{ImageBuffer, Rgb};
-use opensimplex_noise_rs::OpenSimplexNoise;
 
 use rand::Rng;
 
-const IMAGE_SIZE: [i32; 2] = [2048, 2048];
-const WIN_SIZE: [i32; 2] = [512, 512];
+use glutin_window::GlutinWindow as Window;
+use opengl_graphics::{OpenGL, Texture};
+use piston::event_loop::{EventSettings, Events};
+use piston::input::RenderEvent;
+use piston::{Button, window::WindowSettings, Key, PressEvent};
 
+const IMAGE_SIZE: [i32; 2] = [2048, 2048];
+const WIN_SCALE: f32 = 0.25;
+const WIN_SIZE: [u32; 2] = [
+    (IMAGE_SIZE[0] as f32 * WIN_SCALE) as u32,
+    (IMAGE_SIZE[0] as f32 * WIN_SCALE) as u32,
+];
 
 fn sum_octaves(
     num_iterations: i32,
@@ -39,11 +41,7 @@ fn sum_octaves(
     (noise / max_amp) * (high - low) / 2.0 + (high + low) / 2.0
 }
 
-fn color_to_array(color: Color) -> [u8; 3] {
-    [color.r, color.g, color.b]
-}
-
-async fn generate_gradient() -> Vec<f32> {
+fn generate_gradient() -> Vec<f32> {
     let mut gradient: Vec<f32> = vec![1.0; (IMAGE_SIZE[0] * IMAGE_SIZE[1]) as usize];
 
     for x in 0..IMAGE_SIZE[0] {
@@ -79,13 +77,11 @@ async fn generate_gradient() -> Vec<f32> {
     gradient
 }
 
-async fn generate_maps(gradient: &Vec<f32>) -> (Vec<f32>, Vec<f32>) {
+fn generate_maps(gradient: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut rng = rand::thread_rng();
 
-    let (mut height_map, mut biome_map) = futures::join!(
-        generate_noise_map(rng.gen_range(0, std::i64::MAX), 0.004),
-        generate_noise_map(rng.gen_range(0, std::i64::MAX), 0.007)
-    );
+    let mut height_map = generate_noise_map(rng.gen_range(0, std::i64::MAX), 0.004);
+    let mut biome_map = generate_noise_map(rng.gen_range(0, std::i64::MAX), 0.007);
 
     for x in 0..IMAGE_SIZE[0] {
         for y in 0..IMAGE_SIZE[1] {
@@ -109,7 +105,7 @@ fn get_id_from_pos(x: i32, y: i32) -> usize {
     (x + IMAGE_SIZE[0] * y) as usize
 }
 
-async fn generate_noise_map(seed: i64, scale: f64) -> Vec<f32> {
+fn generate_noise_map(seed: i64, scale: f64) -> Vec<f32> {
     let noise_generator = OpenSimplexNoise::new(Some(seed));
 
     let mut map: Vec<f32> = vec![0.0; (IMAGE_SIZE[0] * IMAGE_SIZE[1]) as usize];
@@ -140,137 +136,109 @@ enum Biomes {
     Snow,
 }
 
-fn get_biome_color(biome: Biomes) -> Color {
+fn get_biome_color(biome: Biomes) -> [u8; 3] {
     match biome {
-        Biomes::Grass => Color::RGB(120, 157, 80),
-        Biomes::Water => Color::RGB(9, 82, 198),
-        Biomes::DeepWater => Color::RGB(0, 62, 178),
-        Biomes::Dirt => Color::RGB(114, 98, 49),
-        Biomes::Sand => Color::RGB(194, 178, 128),
-        Biomes::WetSand => Color::RGB(164, 148, 99),
-        Biomes::DarkForest => Color::RGB(60, 97, 20),
-        Biomes::HighDarkForest => Color::RGB(40, 77, 0),
-        Biomes::LightForest => Color::RGB(85, 122, 45),
-        Biomes::Mountain => Color::RGB(140, 142, 123),
-        Biomes::HighMountain => Color::RGB(160, 162, 143),
-        Biomes::Snow => Color::RGB(235, 235, 235),
+        Biomes::Grass => [120, 157, 80],
+        Biomes::Water => [9, 82, 198],
+        Biomes::DeepWater => [0, 62, 178],
+        Biomes::Dirt => [114, 98, 49],
+        Biomes::Sand => [194, 178, 128],
+        Biomes::WetSand => [164, 148, 99],
+        Biomes::DarkForest => [60, 97, 20],
+        Biomes::HighDarkForest => [40, 77, 0],
+        Biomes::LightForest => [85, 122, 45],
+        Biomes::Mountain => [140, 142, 123],
+        Biomes::HighMountain => [160, 162, 143],
+        Biomes::Snow => [235, 235, 235],
     }
 }
 
-enum AppState {
-    Load,
-    GenerateImage,
-    View,
-}
+fn generate_image(height_map: &[f32], biome_map: &[f32]) -> ImageBuffer<Rgb<u8>, Vec<u8>> {
+    let mut image =
+        ImageBuffer::<Rgb<u8>, Vec<u8>>::new(IMAGE_SIZE[0] as u32, IMAGE_SIZE[1] as u32);
 
-#[tokio::main]
-async fn main() {
-    let mut app_state = AppState::Load;
+    for x in 0..IMAGE_SIZE[0] {
+        for y in 0..IMAGE_SIZE[1] {
+            let height = height_map[get_id_from_pos(x, y)];
+            let moisture = biome_map[get_id_from_pos(x, y)];
 
-    let mut image = ImageBuffer::<Rgb<u8>, Vec<u8>>::new(IMAGE_SIZE[0] as u32, IMAGE_SIZE[1] as u32);
+            let biome = match (height, moisture) {
+                (a, _) if a < 0.39 => Biomes::DeepWater,
+                (a, _) if a < 0.42 => Biomes::Water,
+                (a, b) if a < 0.46 && b < 0.57 => Biomes::Sand,
+                (a, b) if a < 0.47 && b < 0.6 => Biomes::WetSand,
+                (a, b) if a < 0.47 && b >= 0.6 => Biomes::Dirt,
+                (a, b) if a > 0.54 && b < 0.43 && a < 0.62 => Biomes::Grass,
+                (a, b) if a < 0.62 && b >= 0.58 => Biomes::HighDarkForest,
+                (a, b) if a < 0.62 && b >= 0.49 => Biomes::DarkForest,
+                (a, _) if a >= 0.79 => Biomes::Snow,
+                (a, _) if a >= 0.74 => Biomes::HighMountain,
+                (a, b) if a >= 0.68 && b >= 0.10 => Biomes::Mountain,
+                _ => Biomes::LightForest,
+            };
 
-    println!("Generating gradient...");
-    let gradient = generate_gradient().await;
-    println!("DONE");
-    let mut height_map: Vec<f32> = Vec::new();
-    let mut biome_map: Vec<f32> = Vec::new();
-
-
-    'running: loop {
-        match app_state {
-            AppState::Load => {
-
-                println!("Generating maps...");
-                
-                let (height, biome) = generate_maps(&gradient).await;
-                height_map = height;
-                biome_map = biome;
-                
-                println!("DONE");
-                
-                app_state = AppState::GenerateImage;
-            }
-            AppState::GenerateImage => {
-                println!("Generating image...");
-                for x in 0..IMAGE_SIZE[0] {
-                    for y in 0..IMAGE_SIZE[1] {
-                        let height = height_map[get_id_from_pos(x, y)];
-                        let moisture = biome_map[get_id_from_pos(x, y)];
-
-                        let biome = match (height, moisture) {
-                            (a, _) if a < 0.39 => Biomes::DeepWater,
-                            (a, _) if a < 0.42 => Biomes::Water,
-                            (a, b) if a < 0.46 && b < 0.57 => Biomes::Sand,
-                            (a, b) if a < 0.47 && b < 0.6 => Biomes::WetSand,
-                            (a, b) if a < 0.47 && b >= 0.6 => Biomes::Dirt,
-                            (a, b) if a > 0.54 && b < 0.43 && a < 0.62 => Biomes::Grass,
-                            (a, b) if a < 0.62 && b >= 0.58 => Biomes::HighDarkForest,
-                            (a, b) if a < 0.62 && b >= 0.49 => Biomes::DarkForest,
-                            (a, _) if a >= 0.79 => Biomes::Snow,
-                            (a, _) if a >= 0.74 => Biomes::HighMountain,
-                            (a, b) if a >= 0.68 && b >= 0.10 => Biomes::Mountain,
-                            _ => Biomes::LightForest,
-                        };
-
-                        let color = get_biome_color(biome);
-                        let pixel = image.get_pixel_mut(x as u32, y as u32);
-                        *pixel = image::Rgb(color_to_array(color));
-                    }
-                }
-                image.save("output.png").unwrap();
-                println!("DONE");
-                app_state = AppState::View;
-            },
-            AppState::View => {
-                let sdl_context = sdl2::init().unwrap();
-                let video_subsystem = sdl_context.video().unwrap();
-
-                let _image_context = sdl2::image::init(InitFlag::PNG | InitFlag::JPG)?;
-
-                let window = video_subsystem
-                    .window(
-                        "noise visualization demo",
-                        WIN_SIZE[0] as u32,
-                        WIN_SIZE[1] as u32,
-                    )
-                    .position_centered()
-                    .build()
-                    .unwrap();
-                let mut canvas = window.into_canvas().build().unwrap();
-
-                let texture_creator = canvas.texture_creator();
-                let texture = texture_creator.load_texture("output.png")?;
-
-                canvas.copy(&texture, None, None)?;
-                canvas.present();
-
-                let mut event_pump = sdl_context.event_pump().unwrap();
-                'view: loop {
-                    canvas.clear();
-                    for event in event_pump.poll_iter() {
-                        match event {
-                            Event::Quit { .. }
-                            | Event::KeyDown {
-                                keycode: Some(Keycode::Escape),
-                                ..
-                            } => {
-                                break 'running;
-                            },
-                            Event::KeyDown {
-                                keycode: Some(Keycode::Space),
-                                ..
-                            } => {
-                                app_state = AppState::Load;
-                                break 'view;
-                            }
-                            _ => {}
-                        }
-                    }
-                    
-                }
-            }
+            let color = get_biome_color(biome);
+            let pixel = image.get_pixel_mut(x as u32, y as u32);
+            *pixel = image::Rgb(color);
         }
     }
 
-    image.save("output.png").unwrap();
+    image
+}
+
+fn main() {
+    println!("Generating gradient...");
+    let gradient = generate_gradient();
+    println!("DONE");
+
+    'running: loop {
+        println!("Generating maps...");
+        let (height_map, biome_map) = generate_maps(&gradient);
+        println!("DONE");
+
+        println!("Generating image...");
+        let image = generate_image(&height_map, &biome_map);
+        image.save("output.png").unwrap();
+        println!("DONE");
+
+        let opengl = OpenGL::V3_2;
+        let mut window: Window =
+            WindowSettings::new("Terrain map generator - 2d", [WIN_SIZE[0], WIN_SIZE[1]])
+                .exit_on_esc(false)
+                .graphics_api(opengl)
+                .resizable(false)
+                .build()
+                .unwrap();
+
+        let mut gl = opengl_graphics::GlGraphics::new(opengl);
+
+        let settings = piston_window::TextureSettings::new();
+
+        settings.filter(piston_window::Filter::Nearest);
+
+        let texture = Texture::from_path(std::path::Path::new("output.png"), &settings).unwrap();
+
+        let mut events = Events::new(EventSettings::new());
+        while let Some(e) = events.next(&mut window) {
+            if let Some(Button::Keyboard(key)) = e.press_args() {
+                if key == Key::Space {
+                    continue 'running;
+                }
+                if key == Key::Escape {
+                    break 'running;
+                }
+            };
+            if let Some(r) = e.render_args() {
+                use graphics::*;
+
+                gl.draw(r.viewport(), |c, g| {
+                    clear([1.0; 4], g);
+
+                    let transform = c.transform.zoom(WIN_SCALE as f64);
+
+                    image(&texture, transform, g);
+                });
+            }
+        }
+    }
 }
